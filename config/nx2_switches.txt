@@ -1,0 +1,6 @@
+# A placer a cote de lichii.exe. Lu au demarrage de l'emulateur.
+#
+# Frizti v3 active le "preflush" d'office pour Ocarina of Time. Son propre code note qu'il a
+# deja donne des donnees d'exposition perimees (images surexposees) ; le couper a reduit les
+# flashs blancs dans nos essais. Cout annonce par le code : environ 3 images/s.
+EDEN_NX2_PREFLUSH=0

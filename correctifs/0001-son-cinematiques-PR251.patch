@@ -1,0 +1,420 @@
+diff --git a/src/audio_core/renderer/command/data_source/decode.cpp b/src/audio_core/renderer/command/data_source/decode.cpp
+index 0f6f782..673c11f 100644
+--- a/src/audio_core/renderer/command/data_source/decode.cpp
++++ b/src/audio_core/renderer/command/data_source/decode.cpp
+@@ -11,6 +11,7 @@
+ #include "audio_core/renderer/command/resample/resample.h"
+ #include "common/fixed_point.h"
+ #include "common/logging.h"
++#include "common/nx2_movie_clock.h"
+ #include "common/scratch_buffer.h"
+ #include "core/guest_memory.h"
+ #include "core/memory.h"
+@@ -338,6 +339,10 @@ void DecodeFromWaveBuffers(Core::Memory::Memory& memory, const DecodeFromWaveBuf
+             }
+ 
+             played_sample_count += samples_decoded;
++            if (Common::Nx2MovieClock::Enabled()) {
++                Common::Nx2MovieClock::Add(Common::Nx2MovieClock::Get().voice_samples,
++                                           static_cast<u64>(samples_decoded));
++            }
+             samples_read += samples_decoded;
+             temp_buffer_pos += samples_decoded;
+             offset += samples_decoded;
+diff --git a/src/audio_core/renderer/system.cpp b/src/audio_core/renderer/system.cpp
+index 2e3e741..14e453a 100644
+--- a/src/audio_core/renderer/system.cpp
++++ b/src/audio_core/renderer/system.cpp
+@@ -32,6 +32,7 @@
+ #include "audio_core/renderer/voice/voice_info.h"
+ #include "audio_core/renderer/voice/voice_state.h"
+ #include "common/alignment.h"
++#include "common/nx2_movie_clock.h"
+ #include "core/core.h"
+ #include "core/core_timing.h"
+ #include "core/hle/kernel/k_event.h"
+@@ -453,6 +454,9 @@ void System::Stop() {
+ 
+ Result System::Update(std::span<const u8> input, std::span<u8> performance, std::span<u8> output) {
+     std::scoped_lock l{lock};
++    if (Common::Nx2MovieClock::Enabled()) {
++        Common::Nx2MovieClock::Add(Common::Nx2MovieClock::Get().renderer_updates, 1);
++    }
+ 
+     const auto start_time{core.CoreTiming().GetGlobalTimeNs().count()};
+     std::memset(output.data(), 0, output.size());
+@@ -743,6 +747,11 @@ u64 System::GenerateCommand(std::span<u8> in_command_buffer,
+     num_command_lists_generated++;
+     render_start_tick = audio_renderer.GetRenderingStartTick(session_id);
+     frames_elapsed++;
++    if (Common::Nx2MovieClock::Enabled()) {
++        auto& clock = Common::Nx2MovieClock::Get();
++        Common::Nx2MovieClock::Add(clock.renderer_passes, 1);
++        Common::Nx2MovieClock::Add(clock.voices_dropped, static_cast<u64>(num_voices_dropped));
++    }
+ 
+     return command_buffer.size;
+ }
+diff --git a/src/audio_core/sink/sdl3_sink.cpp b/src/audio_core/sink/sdl3_sink.cpp
+index 061e216..12e07de 100644
+--- a/src/audio_core/sink/sdl3_sink.cpp
++++ b/src/audio_core/sink/sdl3_sink.cpp
+@@ -78,13 +78,16 @@ public:
+      * @param system_channels_ - Number of channels the audio systems expect.
+      * @param output_device    - Name of the output device to use for this stream.
+      * @param input_device     - Name of the input device to use for this stream.
++     * @param name_            - Name of this stream.
+      * @param type_            - Type of this stream.
+      * @param system_          - Core system.
+      * @param event            - Event used only for audio renderer, signalled on buffer consume.
+      */
+     SDLSinkStream(u32 device_channels_, u32 system_channels_, const std::string& output_device,
+-                  const std::string& input_device, StreamType type_, Core::System& system_)
++                  const std::string& input_device, const std::string& name_, StreamType type_,
++                  Core::System& system_)
+         : SinkStream{system_, type_} {
++        name = name_;
+         system_channels = system_channels_;
+         device_channels = device_channels_;
+ 
+@@ -253,10 +256,10 @@ SDLSink::SDLSink(std::string_view target_device_name) {
+ SDLSink::~SDLSink() = default;
+ 
+ SinkStream* SDLSink::AcquireSinkStream(Core::System& system, u32 system_channels_,
+-                                       const std::string&, StreamType type) {
++                                       const std::string& name, StreamType type) {
+     system_channels = system_channels_;
+     SinkStreamPtr& stream = sink_streams.emplace_back(std::make_unique<SDLSinkStream>(
+-        device_channels, system_channels, output_device, input_device, type, system));
++        device_channels, system_channels, output_device, input_device, name, type, system));
+     stream->SetDeviceVolume(device_volume);
+     return stream.get();
+ }
+diff --git a/src/audio_core/sink/sink_stream.cpp b/src/audio_core/sink/sink_stream.cpp
+index bfb9475..4acc73f 100644
+--- a/src/audio_core/sink/sink_stream.cpp
++++ b/src/audio_core/sink/sink_stream.cpp
+@@ -17,6 +17,7 @@
+ #include "audio_core/sink/sink_stream.h"
+ #include "common/common_types.h"
+ #include "common/fixed_point.h"
++#include "common/nx2_movie_clock.h"
+ #include "common/scope_exit.h"
+ #include "common/settings.h"
+ #include "core/core.h"
+@@ -243,6 +244,13 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
+ 
+     std::memcpy(last_frame.data(), &output_buffer[(frames_written - 1) * frame_size], frame_size_bytes);
+ 
++    if (type == StreamType::Render && Common::Nx2MovieClock::Enabled()) {
++        auto& clock = Common::Nx2MovieClock::Get();
++        const size_t index = !name.empty() && name.back() == '1' ? 1 : 0;
++        Common::Nx2MovieClock::Add(clock.sink_frames[index], num_frames);
++        Common::Nx2MovieClock::Add(clock.sink_padded[index], num_frames - actual_frames_written);
++    }
++
+     // EDEN_NX2_AUDIO_LEVEL: log the output peak about every two seconds (is a game audible?).
+     if (static const bool meter = std::getenv("EDEN_NX2_AUDIO_LEVEL") != nullptr;
+         meter || type == StreamType::Sysmix) {
+diff --git a/src/common/CMakeLists.txt b/src/common/CMakeLists.txt
+index 4e1d798..703a2d5 100644
+--- a/src/common/CMakeLists.txt
++++ b/src/common/CMakeLists.txt
+@@ -47,6 +47,7 @@ add_library(
+     dkb_cpu_trace.h
+     nx2_sampler.cpp
+     nx2_sampler.h
++    nx2_movie_clock.h
+     dynamic_library.cpp
+     dynamic_library.h
+     elf.h
+diff --git a/src/common/nx2_movie_clock.h b/src/common/nx2_movie_clock.h
+new file mode 100644
+index 0000000..372840f
+--- /dev/null
++++ b/src/common/nx2_movie_clock.h
+@@ -0,0 +1,41 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <atomic>
++#include <cstdlib>
++
++#include "common/common_types.h"
++
++// EDEN_NX2_MOVIE_CLOCK=1: per-second counts of video, audio and clock progress.
++namespace Common::Nx2MovieClock {
++
++inline bool Enabled() {
++    static const bool enabled = std::getenv("EDEN_NX2_MOVIE_CLOCK") != nullptr;
++    return enabled;
++}
++
++struct Counters {
++    std::atomic<u64> video_takes{};
++    std::atomic<u64> video_releases{};
++    std::atomic<u64> take_to_release_us{}; // sum over releases
++    std::atomic<u64> video_last_pts_us{};
++    std::atomic<u64> renderer_updates{};
++    std::atomic<u64> renderer_passes{};
++    std::atomic<u64> voices_dropped{};
++    std::atomic<u64> voice_samples{}; // decoded by all voices, at their own rates
++    std::atomic<u64> sink_frames[2]{};  // per render stream, sent to the host device
++    std::atomic<u64> sink_padded[2]{};  // of those, repeated or silent for lack of data
++};
++
++inline Counters& Get() {
++    static Counters counters;
++    return counters;
++}
++
++inline void Add(std::atomic<u64>& counter, u64 value) {
++    counter.fetch_add(value, std::memory_order_relaxed);
++}
++
++} // namespace Common::Nx2MovieClock
+diff --git a/src/core/hle/service/nx2_gsv.h b/src/core/hle/service/nx2_gsv.h
+index a7fc187..e53648a 100644
+--- a/src/core/hle/service/nx2_gsv.h
++++ b/src/core/hle/service/nx2_gsv.h
+@@ -30,6 +30,7 @@
+ #include "common/div_ceil.h"
+ #include "common/dkb_frame_trace.h"
+ #include "common/game_presets.h"
++#include "common/nx2_movie_clock.h"
+ #include "common/settings.h"
+ #include "common/thread.h"
+ #include "core/core.h"
+@@ -1864,11 +1865,56 @@ private:
+                 m_stats = {.last_present = entered};
+             }
+         }
++        if (Common::Nx2MovieClock::Enabled()) {
++            LogMovieClock(paced);
++        }
+         constexpr u64 AvailableSlots = 0x7fff;
+         TipcReplyWords(ctx, {static_cast<u32>(AvailableSlots),
+                              static_cast<u32>(AvailableSlots >> 32), 0, 0, 0, 0});
+     }
+ 
++    struct MovieClockState {
++        std::chrono::steady_clock::time_point wall{};
++        s64 guest_ns{};
++        u64 presents{};
++        std::array<u64, 12> counts{};
++    };
++    MovieClockState m_movie_clock{};
++
++    void LogMovieClock(std::chrono::steady_clock::time_point now) {
++        auto& c = Common::Nx2MovieClock::Get();
++        const auto load = [](const std::atomic<u64>& v) { return v.load(std::memory_order_relaxed); };
++        const std::array<u64, 12> counts{
++            load(c.video_takes),    load(c.video_releases),   load(c.take_to_release_us),
++            load(c.renderer_updates), load(c.renderer_passes), load(c.voices_dropped),
++            load(c.voice_samples),  load(c.sink_frames[0]),    load(c.sink_padded[0]),
++            load(c.sink_frames[1]), load(c.sink_padded[1]),    0};
++        const s64 guest_ns = system.CoreTiming().GetGlobalTimeNs().count();
++        auto& last = m_movie_clock;
++        ++last.presents;
++        if (last.wall == std::chrono::steady_clock::time_point{}) {
++            last = {now, guest_ns, 0, counts};
++            return;
++        }
++        if (now - last.wall < std::chrono::seconds{1}) {
++            return;
++        }
++        std::array<u64, 12> d{};
++        for (size_t i = 0; i < d.size(); ++i) {
++            d[i] = counts[i] - last.counts[i];
++        }
++        const double wall_ms = std::chrono::duration<double, std::milli>(now - last.wall).count();
++        LOG_INFO(Service,
++                 "Nx2 movie clock: wall {:.1f} ms, guest {:.1f} ms | presents {} | video takes {} "
++                 "releases {} take->release {:.1f} ms, pts {:.3f} s | audio updates {} passes {} "
++                 "dropped {} voice samples {} | sink0 {} ({} padded) sink1 {} ({} padded)",
++                 wall_ms, static_cast<double>(guest_ns - last.guest_ns) / 1e6, last.presents,
++                 d[0], d[1], d[1] ? static_cast<double>(d[2]) / static_cast<double>(d[1]) / 1000.0 : 0.0,
++                 static_cast<double>(load(c.video_last_pts_us)) / 1e6, d[3], d[4], d[5], d[6], d[7],
++                 d[8], d[9], d[10]);
++        last = {now, guest_ns, 0, counts};
++    }
++
+     // The console's compositor frees a buffer only once its frame's GPU fence has passed, which
+     // is what keeps a game from running ahead of the GPU. This reply always reports every buffer
+     // free, so pace the game here instead: wait (bounded, in case the GPU waits on the CPU) until
+@@ -2701,6 +2747,37 @@ private:
+         u32 value;
+     };
+ 
++    // Ocarina shows one movie frame per game frame: skip late ones on a real clock (m_mutex held).
++    static constexpr u64 OcarinaOfTimeMovieProgramId = 0x0400486024DEC000ULL;
++    static constexpr auto MovieClockPause = std::chrono::seconds{1};
++
++    bool SyncsToClock() {
++        return system.GetApplicationProcessProgramID() == OcarinaOfTimeMovieProgramId;
++    }
++
++    bool IsLate(u64 pts) const {
++        if (!m_clock_running) {
++            return false;
++        }
++        const auto now = std::chrono::steady_clock::now();
++        if (now - m_clock_last_take > MovieClockPause) {
++            return false;
++        }
++        const auto elapsed =
++            std::chrono::duration_cast<std::chrono::microseconds>(now - m_clock_start).count();
++        const u64 due = m_clock_start_pts + static_cast<u64>((std::max<s64>)(elapsed, 0));
++        return pts + 2 * m_frame_us < due;
++    }
++
++    void EndMovieClock() {
++        if (m_late_dropped != 0) {
++            LOG_INFO(Service, "{} skipped {} late frames to keep the movie in time",
++                     GetServiceName(), m_late_dropped);
++        }
++        m_late_dropped = 0;
++        m_clock_running = false;
++    }
++
+     static constexpr u32 NoSyncpoint = ~0U;
+     static constexpr size_t MaxDecodedAhead = 2; // decoded frames held while no image is free
+     static constexpr u32 HostSyncpoints = 192;   // Tegra::Host1x::SyncpointManager
+@@ -2786,6 +2863,8 @@ private:
+             m_codec = std::move(codec);
+             m_width = w[5];
+             m_height = w[6];
++            m_frame_us = w[7] != 0 && w[7] <= 240 ? u64{1'000'000} / w[7] : u64{1'000'000} / 60;
++            m_clock_running = false;
+         }
+         if (!m_worker.joinable()) {
+             m_worker = std::thread{[this] { DecodeLoop(); }};
+@@ -2878,6 +2957,17 @@ private:
+     void ReleaseBuffer(HLERequestContext& ctx) {
+         const auto* w = ctx.CommandBuffer();
+         Log(ctx, "release output");
++        if (const auto taken = m_take_times.find(w[2]);
++            Common::Nx2MovieClock::Enabled() && taken != m_take_times.end()) {
++            auto& clock = Common::Nx2MovieClock::Get();
++            Common::Nx2MovieClock::Add(clock.video_releases, 1);
++            Common::Nx2MovieClock::Add(
++                clock.take_to_release_us,
++                static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
++                                     std::chrono::steady_clock::now() - taken->second)
++                                     .count()));
++            m_take_times.erase(taken);
++        }
+         const auto handle = HandOut(w[2], Fence{~w[4], w[6]});
+         TipcReplyWords(ctx, {handle[0], handle[1], handle[2], handle[3]});
+     }
+@@ -2971,6 +3061,7 @@ private:
+                          m_decoded_frames, m_frames_out, m_stream_ended, m_end_queued);
+             }
+             CompleteHandedFences();
++            EndMovieClock();
+         }
+         TipcReplyWords(ctx, {});
+     }
+@@ -3001,6 +3092,11 @@ private:
+             if (!m_outputs.empty()) {
+                 output = m_outputs.front();
+                 m_outputs.pop_front();
++                const auto now = std::chrono::steady_clock::now();
++                if (m_clock_running && now - m_clock_last_take > MovieClockPause) {
++                    m_clock_start += now - m_clock_last_take;
++                }
++                m_clock_last_take = now;
+             }
+         }
+         if (!output) {
+@@ -3013,6 +3109,12 @@ private:
+             rb.PushRaw<u32>(0x1c286f);
+             return;
+         }
++        if (Common::Nx2MovieClock::Enabled()) {
++            auto& clock = Common::Nx2MovieClock::Get();
++            Common::Nx2MovieClock::Add(clock.video_takes, 1);
++            clock.video_last_pts_us.store(output->pts, std::memory_order_relaxed);
++            m_take_times[output->image] = std::chrono::steady_clock::now();
++        }
+         const u64 pts_ns = output->pts * 1000;
+         if (Nx2VideoTraceEnabled()) {
+             LOG_INFO(Service, "nx2:vdec trace output syncpoint={} image={} size={}x{} pts={} eos={}",
+@@ -3044,6 +3146,7 @@ private:
+             if (m_flush) {
+                 m_flush = false;
+                 m_decoded.clear();
++                EndMovieClock();
+                 if (decoder) {
+                     lk.unlock();
+                     decoder->Reset();
+@@ -3052,8 +3155,19 @@ private:
+                 continue;
+             }
+             if (!m_decoded.empty() && !m_free.empty()) {
++                while (m_decoded.size() > 1 && !m_decoded.front().end &&
++                       IsLate(m_decoded.front().pts)) {
++                    m_decoded.pop_front();
++                    ++m_late_dropped;
++                }
+                 Decoded frame = std::move(m_decoded.front());
+                 m_decoded.pop_front();
++                if (!m_clock_running && frame.picture && !frame.end && SyncsToClock()) {
++                    m_clock_running = true;
++                    m_clock_start = std::chrono::steady_clock::now();
++                    m_clock_last_take = m_clock_start;
++                    m_clock_start_pts = frame.pts;
++                }
+                 const u32 image = m_free.front();
+                 m_free.pop_front();
+                 std::optional<Fence> fence;
+@@ -3073,6 +3187,7 @@ private:
+                     m_stream_ended = true;
+                     m_end_queued = false;
+                     m_ready->room.store(false, std::memory_order_relaxed);
++                    EndMovieClock();
+                 }
+                 system.Host1x().GetSyncpointManager().IncrementGuest(m_syncpoint);
+                 m_last_output = m_outputs.back();
+@@ -3128,9 +3243,22 @@ private:
+             if (m_flush) {
+                 continue;
+             }
+-            for (auto& picture : pictures) {
+-                const u64 pts = picture.pts;
+-                m_decoded.push_back({std::move(picture), pts, false});
++            for (size_t i = 0; i < pictures.size(); ++i) {
++                const u64 pts = pictures[i].pts;
++                if (IsLate(pts)) {
++                    const bool last = input.end && i + 1 == pictures.size();
++                    const bool newer_follows = i + 1 < pictures.size() || !m_inputs.Empty();
++                    if (!last && newer_follows) {
++                        ++m_late_dropped;
++                        continue;
++                    }
++                    while (!m_decoded.empty() && !m_decoded.back().end &&
++                           IsLate(m_decoded.back().pts)) {
++                        m_decoded.pop_back();
++                        ++m_late_dropped;
++                    }
++                }
++                m_decoded.push_back({std::move(pictures[i]), pts, false});
+             }
+             if (input.end) {
+                 // The client stops at the frame marked end of stream; give it one even when the
+@@ -3329,6 +3457,13 @@ private:
+     bool m_end_queued{};
+     bool m_flush{};
+     bool m_quit{};
++    std::map<u32, std::chrono::steady_clock::time_point> m_take_times;
++    u64 m_frame_us{1'000'000 / 60};
++    bool m_clock_running{};
++    std::chrono::steady_clock::time_point m_clock_start{};
++    std::chrono::steady_clock::time_point m_clock_last_take{};
++    u64 m_clock_start_pts{};
++    u64 m_late_dropped{};
+     std::thread m_worker;
+ };
+ 

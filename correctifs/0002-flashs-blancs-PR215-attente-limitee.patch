@@ -1,0 +1,176 @@
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index bc50a9b..ff5343a 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -1838,8 +1838,8 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
+                                          9);
+     const auto flush_queries = [&](GPUVAddr begin, size_t bytes) {
+         split.Run(
+-            [memory = &memory_manager, begin, bytes] {
+-                memory->FlushRegion(begin, bytes, VideoCommon::CacheType::QueryCache);
++            [this, begin, bytes] {
++                VideoCommon::QueryDma::FlushPending(memory_manager, *rasterizer, begin, bytes);
+             },
+             VideoCommon::DrainSite::MacroDmaFlush);
+     };
+@@ -1973,8 +1973,8 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
+     // occlusion reports return stale counts and the guest culls visible objects. The non-split
+     // path in macro.cpp has the matching flush.
+     split.Run(
+-        [memory = &memory_manager, source, read_bytes] {
+-            memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::QueryCache);
++        [this, source, read_bytes] {
++            VideoCommon::QueryDma::FlushPending(memory_manager, *rasterizer, source, read_bytes);
+         },
+         VideoCommon::DrainSite::MacroDmaFlush);
+     u32 changed{};
+diff --git a/src/video_core/macro.cpp b/src/video_core/macro.cpp
+index 65e87c4..5fb49db 100644
+--- a/src/video_core/macro.cpp
++++ b/src/video_core/macro.cpp
+@@ -1449,7 +1449,8 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
+                                                      source, read_bytes);
+                     }
+                     if (owns_caches) {
+-                        memory.FlushRegion(source, read_bytes, VideoCommon::CacheType::QueryCache);
++                        VideoCommon::QueryDma::FlushPending(memory, maxwell3d.Rasterizer(), source,
++                                                            read_bytes);
+                     }
+                     if (memory.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
+                         memory.FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
+diff --git a/src/video_core/query_cache/query_cache_base.h b/src/video_core/query_cache/query_cache_base.h
+index e3f99e8..79477ee 100644
+--- a/src/video_core/query_cache/query_cache_base.h
++++ b/src/video_core/query_cache/query_cache_base.h
+@@ -63,14 +63,19 @@ public:
+     }
+ 
+     void FlushRegion(VAddr addr, std::size_t size) {
++        if (SemiFlushRegion(addr, size)) {
++            RequestGuestHostSync();
++        }
++    }
++
++    /// Writes out the finalized reports in the region. True when some still wait for host results.
++    bool SemiFlushRegion(VAddr addr, std::size_t size) {
+         bool result = false;
+         IterateCache<false>(addr, size, [this, &result](QueryLocation location) {
+             result |= SemiFlushQueryDirty(location);
+             return result;
+         });
+-        if (result) {
+-            RequestGuestHostSync();
+-        }
++        return result;
+     }
+ 
+     static u64 BuildMask(std::span<const QueryType> types) {
+diff --git a/src/video_core/query_dma.h b/src/video_core/query_dma.h
+index fdcc223..c236cca 100644
+--- a/src/video_core/query_dma.h
++++ b/src/video_core/query_dma.h
+@@ -43,6 +43,21 @@ inline bool HasPendingQueries(const Tegra::MemoryManager& memory,
+     return false;
+ }
+ 
++/// Writes the reports in [source, source + size) to guest memory, waiting for pending host
++/// results. Runs where the rasterizer's caches are owned.
++inline void FlushPending(const Tegra::MemoryManager& memory,
++                         VideoCore::RasterizerInterface& rasterizer, GPUVAddr source, size_t size) {
++    constexpr GPUVAddr page_size = 0x1000;
++    const GPUVAddr end = source + size;
++    for (GPUVAddr begin = source; begin < end;) {
++        const GPUVAddr page_end = (std::min)((begin & ~(page_size - 1)) + page_size, end);
++        if (const auto device = memory.GpuToCpuAddress(begin)) {
++            rasterizer.FlushQueryResults(*device, page_end - begin);
++        }
++        begin = page_end;
++    }
++}
++
+ /// Logs a read of pending reports with the words it reads, and the same words once the next
+ /// fence has popped and the results have landed.
+ inline void Trace(const Tegra::MemoryManager& memory, VideoCore::RasterizerInterface& rasterizer,
+diff --git a/src/video_core/rasterizer_interface.h b/src/video_core/rasterizer_interface.h
+index 454e2dd..3290a5f 100644
+--- a/src/video_core/rasterizer_interface.h
++++ b/src/video_core/rasterizer_interface.h
+@@ -91,6 +91,11 @@ public:
+     /// Release all pending fences.
+     virtual void ReleaseFences(bool force = true) = 0;
+ 
++    /// Writes the region's query reports to guest memory, waiting for pending host results.
++    virtual void FlushQueryResults(DAddr addr, u64 size) {
++        FlushRegion(addr, size, VideoCommon::CacheType::QueryCache);
++    }
++
+     /// Notify rasterizer that all caches should be flushed to Switch memory
+     virtual void FlushAll() = 0;
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 39be307..de47e10 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -6,7 +6,9 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <chrono>
++#include <condition_variable>
+ #include <memory>
+ #include <limits>
+ #include <cstdio>
+@@ -1988,6 +1990,40 @@ void RasterizerVulkan::ReleaseFences(bool force) {
+     fence_manager.WaitPendingFences(force);
+ }
+ 
++void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
++    if (addr == 0 || size == 0 || !query_cache.SemiFlushRegion(addr, size)) {
++        return;
++    }
++    // Below High GPU accuracy a fence runs its own callback at once, so wait for an operation
++    // queued behind the pending report writes instead. On the split's back the fence's
++    // submission may be deferred, and the fencing thread would wait for this thread to submit it.
++    // The wait is bounded: while emulation stops, the fencing thread no longer runs operations
++    // and an unbounded wait kept the emulation thread from stopping. The state is shared so the
++    // operation stays valid when it runs after a timed-out wait.
++    struct WaitState {
++        std::mutex mutex;
++        std::condition_variable cv;
++        bool written{};
++    };
++    const auto state = std::make_shared<WaitState>();
++    fence_manager.SyncOperation([state] {
++        std::scoped_lock lock{state->mutex};
++        state->written = true;
++        state->cv.notify_all();
++    });
++    fence_manager.SignalFence([] {});
++    scheduler.FlushDeferred();
++    std::unique_lock lock{state->mutex};
++    if (!state->cv.wait_for(lock, std::chrono::milliseconds{100},
++                            [&state] { return state->written; })) {
++        static std::atomic<u64> timeouts{};
++        if (const u64 count = ++timeouts; count <= 8 || count % 1000 == 0) {
++            LOG_WARNING(Render_Vulkan, "Query results not written within 100 ms ({} so far)",
++                        count);
++        }
++    }
++}
++
+ void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
+                                                 VideoCommon::CacheType which) {
+     if (Settings::IsGPULevelHigh()) {
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index 66d0c96..f304c8f 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -130,6 +130,7 @@ public:
+     void SignalSyncPoint(u32 value) override;
+     void SignalReference() override;
+     void ReleaseFences(bool force = true) override;
++    void FlushQueryResults(DAddr addr, u64 size) override;
+     void FlushAndInvalidateRegion(
+         DAddr addr, u64 size, VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
+     void WaitForIdle() override;
